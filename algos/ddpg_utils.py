@@ -1,4 +1,3 @@
-
 import torch.nn.functional as F
 from torch import nn
 from collections import namedtuple
@@ -15,7 +14,7 @@ import pandas as pd
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
-Batch = namedtuple('Batch', ['state', 'action', 'next_state', 'reward', 'not_done', 'extra'])
+Batch = namedtuple('Batch', ['state', 'action', 'next_state', 'reward', 'not_done', 'extra', 'returns'])
 
 # Actor-critic agent
 class Policy(nn.Module):
@@ -43,7 +42,7 @@ class Critic(nn.Module):
 
     def forward(self, state, action):
         x = torch.cat([state, action], 1)
-        return self.value(x) # output shape [batch, 1]
+        return self.value(x)
 
 class ReplayBuffer(object):
     def __init__(self, state_shape:tuple, action_dim: int, max_size=int(1e6)):
@@ -58,18 +57,25 @@ class ReplayBuffer(object):
         self.reward = torch.zeros((max_size, 1), dtype=dtype)
         self.not_done = torch.zeros((max_size, 1), dtype=dtype)
         self.extra = {}
+        
+        #keep track of returns for the SIL
+        self.returns = torch.zeros((max_size, 1), dtype=torch.float32)  # Buffer to store returns (for SIL)
     
     def _to_tensor(self, data, dtype=torch.float32):   
         if isinstance(data, torch.Tensor):
             return data.to(dtype=dtype)
         return torch.tensor(data, dtype=dtype)
 
-    def add(self, state, action, next_state, reward, done, extra:dict=None):
+    def add(self, state, action, next_state, reward, done, extra:dict=None, return_val = None):
         self.state[self.ptr] = self._to_tensor(state, dtype=self.state.dtype)
         self.action[self.ptr] = self._to_tensor(action)
         self.next_state[self.ptr] = self._to_tensor(next_state, dtype=self.state.dtype)
         self.reward[self.ptr] = self._to_tensor(reward)
         self.not_done[self.ptr] = self._to_tensor(1. - done)
+        
+        #if we add a sil value then add it
+        if return_val is not None:
+            self.returns[self.ptr] = self._to_tensor(return_val)
 
         if extra is not None:
             for key, value in extra.items():
@@ -80,8 +86,19 @@ class ReplayBuffer(object):
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
-    def sample(self, batch_size, device='cpu'):
-        ind = np.random.randint(0, self.size, size=batch_size)
+    def sample(self, batch_size, device='cpu', sil = False):
+        #if we sample with SIL then do this otherwise do the normal sampling
+        if sil:
+            # SIL sampling: prioritize high-return experiences
+            normalized_returns = self.returns[:self.size].squeeze().numpy()
+            if np.sum(normalized_returns) > 0:
+                probs = normalized_returns / np.sum(normalized_returns)
+                ind = np.random.choice(np.arange(self.size), size=batch_size, p=probs)
+            else:
+                ind = np.random.randint(0, self.size, size=batch_size)
+        else:
+            # Uniform random sampling
+            ind = np.random.randint(0, self.size, size=batch_size)
 
         if self.extra:
             extra = {key: value[ind].to(device) for key, value in self.extra.items()}
@@ -94,7 +111,9 @@ class ReplayBuffer(object):
             next_state = self.next_state[ind].to(device), 
             reward = self.reward[ind].to(device), 
             not_done = self.not_done[ind].to(device), 
-            extra = extra
+            extra = extra,
+            returns=self.returns[ind].to(device)  # Include returns in the batch
+
         )
         return batch
     
@@ -110,7 +129,8 @@ class ReplayBuffer(object):
             next_state = self.next_state[:self.size].to(device), 
             reward = self.reward[:self.size].to(device), 
             not_done = self.not_done[:self.size].to(device), 
-            extra = extra
+            extra = extra,
+            returns=self.returns[:self.size].to(device)  # Include returns in the batch
+
         )
         return batch
-

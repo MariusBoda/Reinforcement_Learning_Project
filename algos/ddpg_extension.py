@@ -1,9 +1,10 @@
 from .agent_base import BaseAgent
-from .old import Policy, Critic, ReplayBuffer
-from .old1 import DDPGAgent
+from .ddpg_utils import Policy, Critic, ReplayBuffer
+from .ddpg_agent import DDPGAgent
 
 import utils.common_utils as cu
 import torch
+from torch import nn
 import numpy as np
 import torch.nn.functional as F
 import copy, time
@@ -58,6 +59,19 @@ class DDPGExtension(DDPGAgent):
         self.buffer_head = self.buffer_ptr
         return info
     
+    def calculate_sil_actor_loss(self, batch):
+        """ Encourage the policy to imitate high-reward actions """
+        q_values = self.q(batch.state, batch.action)
+        sil_actor_loss = -torch.mean(q_values)
+        return sil_actor_loss
+
+    def calculate_sil_critic_loss(self, batch):
+        """ Fit the critic to high-reward returns """
+        target_Q = batch.returns
+        current_Q = self.q(batch.state, batch.action)
+        sil_critic_loss = F.mse_loss(current_Q, target_Q)
+        return sil_critic_loss
+    
     # 1. compute target Q, you should not modify the gradient of the variables
     def calculate_target(self, batch):
         ########## Your code starts here. ##########
@@ -82,41 +96,42 @@ class DDPGExtension(DDPGAgent):
         ########## Your code ends here. ##########
         return actor_loss
 
-    def _update(self,):
-        # get batch data
+    def _update(self):
+        # Sample a batch from the replay buffer
         batch = self.buffer.sample(self.batch_size, device=self.device)
-        #    batch contains:
-        #    state = batch.state, shape [batch, state_dim]
-        #    action = batch.action, shape [batch, action_dim]
-        #    next_state = batch.next_state, shape [batch, state_dim]
-        #    reward = batch.reward, shape [batch, 1]
-        #    not_done = batch.not_done, shape [batch, 1]
 
-        """
-        # TODO: Get the current Q estimate
-        """
+        # Access state and action using dictionary keys
         current_Q = self.q(batch.state, batch.action)
-
         target_Q = self.calculate_target(batch)
+
+        # Calculate critic loss
         critic_loss = self.calculate_critic_loss(current_Q, target_Q)
 
-        # optimize the critic
         self.q_optim.zero_grad()
         critic_loss.backward()
         self.q_optim.step()
 
         actor_loss = self.calculate_actor_loss(batch)
         
-        # optimize the actor
         self.pi_optim.zero_grad()
         actor_loss.backward()
         self.pi_optim.step()
 
-        """
-        # TODO: update the target q and pi using u.soft_update_params() (See the DQN code)
-        """
         cu.soft_update_params(self.pi, self.pi_target, self.tau)
         cu.soft_update_params(self.q, self.q_target, self.tau)
+
+        # SIL Updates
+        sil_batch = self.buffer.sample(self.batch_size, device=self.device, sil=True)
+        sil_actor_loss = self.calculate_sil_actor_loss(sil_batch)
+        sil_critic_loss = self.calculate_sil_critic_loss(sil_batch)
+
+        self.pi_optim.zero_grad()
+        sil_actor_loss.backward()
+        self.pi_optim.step()
+
+        self.q_optim.zero_grad()
+        sil_critic_loss.backward()
+        self.q_optim.step()
 
         return {}
 
@@ -124,7 +139,6 @@ class DDPGExtension(DDPGAgent):
         """ Save transitions to the buffer. """
         self.buffer_ptr += 1
         self.buffer.add(state, action, next_state, reward, done)
-
     
     @torch.no_grad()
     def get_action(self, observation, evaluation=False):
